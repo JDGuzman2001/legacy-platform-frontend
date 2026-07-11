@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react'
+import { useRef, useState, useCallback, useEffect } from 'react'
 import { SimliClient, generateSimliSessionToken, generateIceServers } from 'simli-client'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080'
@@ -9,21 +9,110 @@ const Status = {
   CONNECTING: 'connecting',
   READY: 'ready',
   RECORDING: 'recording',
+  REVIEW: 'review',
   PROCESSING: 'processing',
   ERROR: 'error',
 }
 
-export default function SimliChat({ profileId }) {
+export default function SimliChat({ profileId, accessToken }) {
   const videoRef = useRef(null)
   const audioRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const simliClientRef = useRef(null)
   const chunksRef = useRef([])
+  const audioContextRef = useRef(null)
+  const analyserRef = useRef(null)
+  const animationFrameRef = useRef(null)
+  const canvasRef = useRef(null)
 
   const [status, setStatus] = useState(Status.IDLE)
   const [transcript, setTranscript] = useState('')
   const [answer, setAnswer] = useState('')
   const [error, setError] = useState(null)
+  const [previewUrl, setPreviewUrl] = useState(null)
+  const [microphones, setMicrophones] = useState([])
+  const [selectedMicId, setSelectedMicId] = useState('')
+
+  const stopWaveform = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current)
+      animationFrameRef.current = null
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close()
+      audioContextRef.current = null
+    }
+    analyserRef.current = null
+    const canvas = canvasRef.current
+    if (canvas) {
+      const ctx = canvas.getContext('2d')
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+    }
+  }, [])
+
+  const startWaveform = useCallback((stream) => {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)()
+    const source = audioContext.createMediaStreamSource(stream)
+    const analyser = audioContext.createAnalyser()
+    analyser.fftSize = 256
+    source.connect(analyser)
+
+    audioContextRef.current = audioContext
+    analyserRef.current = analyser
+
+    const bufferLength = analyser.frequencyBinCount
+    const dataArray = new Uint8Array(bufferLength)
+
+    const draw = () => {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      analyser.getByteFrequencyData(dataArray)
+
+      const ctx = canvas.getContext('2d')
+      const width = canvas.width
+      const height = canvas.height
+      ctx.clearRect(0, 0, width, height)
+
+      const barCount = 32
+      const barWidth = width / barCount
+      for (let i = 0; i < barCount; i++) {
+        const dataIndex = Math.floor((i / barCount) * bufferLength)
+        const value = dataArray[dataIndex] / 255
+        const barHeight = Math.max(2, value * height)
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'
+        ctx.fillRect(i * barWidth + 1, (height - barHeight) / 2, barWidth - 2, barHeight)
+      }
+
+      animationFrameRef.current = requestAnimationFrame(draw)
+    }
+
+    draw()
+  }, [])
+
+  useEffect(() => stopWaveform, [stopWaveform])
+
+  const applyMicrophoneList = useCallback((devices) => {
+    const mics = devices.filter((d) => d.kind === 'audioinput')
+    setMicrophones(mics)
+    setSelectedMicId((current) => current || mics[0]?.deviceId || '')
+  }, [])
+
+  const loadMicrophones = useCallback(async () => {
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    applyMicrophoneList(devices)
+  }, [applyMicrophoneList])
+
+  useEffect(() => {
+    let cancelled = false
+    navigator.mediaDevices.enumerateDevices().then((devices) => {
+      if (!cancelled) applyMicrophoneList(devices)
+    })
+    navigator.mediaDevices.addEventListener('devicechange', loadMicrophones)
+    return () => {
+      cancelled = true
+      navigator.mediaDevices.removeEventListener('devicechange', loadMicrophones)
+    }
+  }, [loadMicrophones, applyMicrophoneList])
 
   const startSession = useCallback(async (faceId) => {
     const { session_token } = await generateSimliSessionToken({
@@ -53,7 +142,9 @@ export default function SimliChat({ profileId }) {
     setStatus(Status.CONNECTING)
     setError(null)
     try {
-      const res = await fetch(`${API_BASE}/api/v1/profiles/${profileId}`)
+      const res = await fetch(`${API_BASE}/api/v1/profiles/${profileId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
       if (!res.ok) throw new Error('Profile not found')
       const profile = await res.json()
       if (!profile.simli_face_id) throw new Error('Profile has no simli_face_id configured')
@@ -64,9 +155,14 @@ export default function SimliChat({ profileId }) {
       setError(err.message)
       setStatus(Status.ERROR)
     }
-  }, [profileId, startSession])
+  }, [profileId, accessToken, startSession])
 
   const disconnect = useCallback(async () => {
+    stopWaveform()
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+      setPreviewUrl(null)
+    }
     if (simliClientRef.current) {
       await simliClientRef.current.stop()
       simliClientRef.current = null
@@ -75,63 +171,85 @@ export default function SimliChat({ profileId }) {
     setTranscript('')
     setAnswer('')
     setError(null)
-  }, [])
+  }, [stopWaveform, previewUrl])
 
   const startRecording = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true,
+    })
     chunksRef.current = []
     const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
     recorder.ondataavailable = (e) => chunksRef.current.push(e.data)
     recorder.start()
     mediaRecorderRef.current = recorder
+    startWaveform(stream)
     setStatus(Status.RECORDING)
-  }, [])
+    loadMicrophones()
+  }, [startWaveform, selectedMicId, loadMicrophones])
 
-  const stopRecordingAndSend = useCallback(() => {
+  const stopRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current
     if (!recorder) return
 
-    recorder.onstop = async () => {
-      setStatus(Status.PROCESSING)
-      try {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        const formData = new FormData()
-        formData.append('audio_file', blob, 'audio.webm')
-
-        const res = await fetch(`${API_BASE}/api/v1/profiles/${profileId}/simli-chat`, {
-          method: 'POST',
-          body: formData,
-        })
-        if (!res.ok) throw new Error(`Server error ${res.status}`)
-        const data = await res.json()
-
-        setTranscript(data.transcript)
-        setAnswer(data.answer)
-
-        const pcmBinary = atob(data.audio_pcm_b64)
-        const pcmBuffer = new Uint8Array(pcmBinary.length)
-        for (let i = 0; i < pcmBinary.length; i++) {
-          pcmBuffer[i] = pcmBinary.charCodeAt(i)
-        }
-        simliClientRef.current?.sendAudioData(pcmBuffer)
-
-        setStatus(Status.READY)
-      } catch (err) {
-        setError(err.message)
-        setStatus(Status.ERROR)
-      }
+    recorder.onstop = () => {
+      stopWaveform()
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      setPreviewUrl(URL.createObjectURL(blob))
+      setStatus(Status.REVIEW)
     }
 
     recorder.stop()
     recorder.stream.getTracks().forEach((t) => t.stop())
-  }, [profileId])
+  }, [stopWaveform])
+
+  const discardRecording = useCallback(() => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(null)
+    chunksRef.current = []
+    setStatus(Status.READY)
+  }, [previewUrl])
+
+  const sendRecording = useCallback(async () => {
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+      setPreviewUrl(null)
+    }
+    setStatus(Status.PROCESSING)
+    try {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const formData = new FormData()
+      formData.append('audio_file', blob, 'audio.webm')
+
+      const res = await fetch(`${API_BASE}/api/v1/profiles/${profileId}/simli-chat`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      const data = await res.json()
+
+      setTranscript(data.transcript)
+      setAnswer(data.answer)
+
+      const pcmBinary = atob(data.audio_pcm_b64)
+      const pcmBuffer = new Uint8Array(pcmBinary.length)
+      for (let i = 0; i < pcmBinary.length; i++) {
+        pcmBuffer[i] = pcmBinary.charCodeAt(i)
+      }
+      simliClientRef.current?.sendAudioData(pcmBuffer)
+
+      setStatus(Status.READY)
+    } catch (err) {
+      setError(err.message)
+      setStatus(Status.ERROR)
+    }
+  }, [profileId, previewUrl])
 
   const isActive = status !== Status.IDLE && status !== Status.ERROR
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
       {/* Video feed */}
-      <div className="relative w-full max-w-xl aspect-video bg-muted rounded-xl overflow-hidden shadow-md flex items-center justify-center">
+      <div className="relative w-full max-w-3xl aspect-video bg-muted rounded-xl overflow-hidden shadow-md flex items-center justify-center">
         <video
           ref={videoRef}
           autoPlay
@@ -172,9 +290,10 @@ export default function SimliChat({ profileId }) {
 
         {status === Status.RECORDING && (
           <div className="absolute bottom-3 left-1/2 -translate-x-1/2">
-            <div className="bg-destructive/90 backdrop-blur-sm rounded-full px-3 py-1 flex items-center gap-2">
-              <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
-              <span className="text-xs text-white">Recording…</span>
+            <div className="bg-destructive/90 backdrop-blur-sm rounded-full px-3 py-1.5 flex items-center gap-2">
+              <div className="w-2 h-2 bg-white rounded-full animate-pulse shrink-0" />
+              <canvas ref={canvasRef} width={96} height={24} className="w-24 h-6" />
+              <span className="text-xs text-white shrink-0">Recording…</span>
             </div>
           </div>
         )}
@@ -185,6 +304,22 @@ export default function SimliChat({ profileId }) {
           </div>
         )}
       </div>
+
+      {/* Microphone selector */}
+      {microphones.length > 0 && (
+        <select
+          value={selectedMicId}
+          onChange={(e) => setSelectedMicId(e.target.value)}
+          disabled={status === Status.RECORDING}
+          className="w-full max-w-3xl bg-muted border border-input rounded-lg px-3 py-2 text-sm text-foreground disabled:opacity-50"
+        >
+          {microphones.map((mic, i) => (
+            <option key={mic.deviceId} value={mic.deviceId}>
+              {mic.label || `Microphone ${i + 1}`}
+            </option>
+          ))}
+        </select>
+      )}
 
       {/* Controls */}
       <div className="flex items-center gap-3">
@@ -221,18 +356,36 @@ export default function SimliChat({ profileId }) {
 
         {status === Status.RECORDING && (
           <button
-            onMouseUp={stopRecordingAndSend}
-            onTouchEnd={stopRecordingAndSend}
+            onMouseUp={stopRecording}
+            onTouchEnd={stopRecording}
             className="bg-destructive hover:bg-destructive/90 text-white rounded-full px-6 py-2.5 text-sm font-medium transition-colors flex items-center gap-2 animate-pulse"
           >
             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
               <rect x="6" y="6" width="12" height="12" rx="1" />
             </svg>
-            Release to Send
+            Release to Stop
           </button>
         )}
 
-        {isActive && status !== Status.RECORDING && (
+        {status === Status.REVIEW && (
+          <div className="flex items-center gap-3">
+            <audio src={previewUrl} controls className="h-9" />
+            <button
+              onClick={discardRecording}
+              className="border border-input rounded-full px-4 py-2.5 text-sm text-muted-foreground hover:text-foreground hover:border-foreground/40 transition-colors"
+            >
+              Discard
+            </button>
+            <button
+              onClick={sendRecording}
+              className="bg-primary text-primary-foreground rounded-full px-6 py-2.5 text-sm font-medium hover:opacity-90 transition-opacity"
+            >
+              Send
+            </button>
+          </div>
+        )}
+
+        {isActive && status !== Status.RECORDING && status !== Status.REVIEW && (
           <button
             onClick={disconnect}
             className="border border-input rounded-full px-4 py-2.5 text-sm text-muted-foreground hover:text-foreground hover:border-foreground/40 transition-colors"
@@ -244,7 +397,7 @@ export default function SimliChat({ profileId }) {
 
       {/* Transcript */}
       {(transcript || answer) && (
-        <div className="w-full max-w-xl bg-muted/50 rounded-xl p-4 flex flex-col gap-3 text-sm">
+        <div className="w-full max-w-3xl bg-muted/50 rounded-xl p-4 flex flex-col gap-3 text-sm">
           {transcript && (
             <div className="flex gap-2">
               <span className="text-muted-foreground shrink-0">You:</span>
